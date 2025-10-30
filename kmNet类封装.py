@@ -7,6 +7,10 @@ import threading
 import os
 import ctypes
 import math
+import itertools
+import queue
+from dataclasses import dataclass, field
+from typing import Callable, Optional, Tuple, Any
 
 
 kmNet.init("192.168.2.188","1538","86C2E466")
@@ -14,8 +18,6 @@ kmNet.init("192.168.2.188","1538","86C2E466")
 
 # 全局退出标志
 exit_flag = False
-
-preempt_event = threading.Event()  # 抢占事件
 
 # 定义必要的Windows API,监听键盘按键
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -48,34 +50,169 @@ def 延时(毫秒):
     target_ms = 毫秒  # 目标毫秒数
 
     while True:
-        # 首先检查退出标志
         if exit_flag:
             # 退出前把鼠标左右键释放,防止左右键处于按下状态退出
             kmNet.enc_right(0)
             kmNet.enc_left(0)
             os._exit(0)  # 强制退出整个程序
 
-        # 如果B线程触发set()，A线程就非阻塞方式在while True循环中无线返回，等待直到B释放
-        if preempt_event.is_set():
-            # print("[延时] 被抢占，等待B释放...")
-            preempt_event.wait()  # is_set()检测到事件已处于已触发状态,wait()会立即返回,暂时理解成continue
-            # print("[延时] 抢占释放，继续延时")
-
-        # 计算已过时间（毫秒）
         elapsed_ms = (time.perf_counter() - start) * 1000
-
-        # 如果已满足延时要求，则退出
         if elapsed_ms >= target_ms:
             break
 
-        # 计算剩余时间
         remaining_ms = target_ms - elapsed_ms
-
-        # 确定本次等待时间（不超过100ms）
         sleep_time = min(0.1, remaining_ms / 1000)
-
-        # 等待
         time.sleep(sleep_time)
+
+
+@dataclass(order=True)
+class _InputTask:
+    """内部任务模型：PriorityQueue 会使用 (优先级, 序号, 任务)."""
+
+    priority: int
+    sequence: int
+    action: Callable = field(compare=False)
+    args: Tuple[Any, ...] = field(default_factory=tuple, compare=False)
+    kwargs: dict = field(default_factory=dict, compare=False)
+    name: str = field(default="", compare=False)
+    done: threading.Event = field(default_factory=threading.Event, compare=False)
+    error: Optional[BaseException] = field(default=None, compare=False)
+
+
+class InputBroker:
+    """串行化 my_con 调用的单工人线程调度器（方案B）。
+
+    - 采用 PriorityQueue 实现：数值越小优先级越高，紧急任务先执行。
+    - worker 线程唯一持有 my_con 的控制权，避免多线程抢占导致死锁、按键卡死。
+    - submit() 默认阻塞直到任务完成，可传 block=False 变为异步。
+
+    风险与对策：
+        * 如果任务内部包含长时间循环，应拆分为更小的任务，或提交时使用 block=False
+          让调用线程自行等待/轮询，从而避免阻塞 worker。
+        * 若优先级设置错误导致紧急任务被排队，可通过更小的 priority 值提交，例如 0 表示立即抢占。
+    """
+
+    def __init__(self, controller: "MyController", name: str = "InputWorker"):
+        self._controller = controller
+        self._name = name
+        self._queue: "queue.PriorityQueue[_InputTask]" = queue.PriorityQueue()
+        self._sequence = itertools.count()
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._run, name=name, daemon=True)
+        self._worker.start()
+
+    @property
+    def controller(self) -> "MyController":
+        """暴露底层控制器实例，仅供调试或组合使用。"""
+
+        return self._controller
+
+    def submit(
+        self,
+        action: Callable,
+        *args,
+        priority: int = 100,
+        name: str = "",
+        block: bool = True,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> _InputTask:
+        """提交一个键鼠任务。
+
+        Args:
+            action: 实际执行的回调函数，通常为 my_con 的方法。
+            *args/**kwargs: 传递给回调的参数。
+            priority: 数字越小优先级越高，例如 0 为抢占级。
+            name: 任务调试名称。
+            block: True 时等待任务执行完成，保持旧逻辑的一致性。
+            timeout: 等待完成的超时时间（秒）。
+
+        Returns:
+            _InputTask: 任务对象，可用于等待或检查错误。
+        """
+
+        if self._stop_event.is_set():
+            raise RuntimeError("InputBroker 已停止，不能再提交任务")
+
+        task = _InputTask(
+            priority=priority,
+            sequence=next(self._sequence),
+            action=action,
+            args=args,
+            kwargs=kwargs,
+            name=name,
+        )
+        self._queue.put(task)
+
+        if block:
+            finished = task.done.wait(timeout)
+            if not finished:
+                raise TimeoutError(f"等待任务 {task.name or action.__name__} 超时")
+            if task.error:
+                raise task.error
+
+        return task
+
+    def stop(self) -> None:
+        """停止 worker 线程，通常在程序退出时调用。"""
+
+        self._stop_event.set()
+        # Sentinel：priority=100000 确保排队尾部，但不影响已有任务执行。
+        self._queue.put(
+            _InputTask(
+                priority=100000,
+                sequence=next(self._sequence),
+                action=lambda: None,
+                name="broker-stop",
+            )
+        )
+        self._worker.join(timeout=1)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                task: _InputTask = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                task.action(*task.args, **task.kwargs)
+            except BaseException as exc:  # noqa: BLE001 - 记录并传播所有异常
+                task.error = exc
+                print(f"[InputBroker] 任务 {task.name or task.action.__name__} 执行失败: {exc}")
+            finally:
+                task.done.set()
+
+
+# 方案A：最小改动的互斥锁封装，供极端情况下退回旧逻辑
+my_con_lock = threading.RLock()
+cooperative_preempt = threading.Event()
+
+
+def safe_keypress(controller: "MyController", hid_value: int, 延时a: int = 70, 延时b: int = 200) -> None:
+    """方案A：带协作抢占检查的安全按键调用。
+
+    - 当 cooperative_preempt 被 set() 时，调用方应提前释放锁并重试，避免长时间持锁。
+    - 推荐仅在 InputBroker 不可用时使用。
+    """
+
+    while True:
+        acquired = my_con_lock.acquire(timeout=0.2)
+        if not acquired:
+            # 锁被长时间占用，主动检查是否有抢占请求
+            if cooperative_preempt.is_set():
+                time.sleep(0.05)
+            continue
+
+        try:
+            if cooperative_preempt.is_set():
+                # 有抢占请求时释放控制权，让高优先级逻辑先执行
+                time.sleep(0.01)
+                continue
+            controller.键盘点击(hid_value, 延时a, 延时b)
+            break
+        finally:
+            my_con_lock.release()
 
 class 游戏坐标系统():
     def __init__(self,MouseController=None):
