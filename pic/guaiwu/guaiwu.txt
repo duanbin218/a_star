@@ -1,0 +1,8 @@
+pic/guaiwu/暗之虹魔教主.bmp
+pic/guaiwu/暗之魔龙力士.bmp
+pic/guaiwu/魔龙刀兵.bmp
+pic/guaiwu/魔龙射手.bmp
+pic/guaiwu/魔龙巨蛾.bmp
+pic/guaiwu/魔龙战将.bmp
+pic/guaiwu/魔龙教主.bmp
+pic/guaiwu/魔龙破甲兵.bmp
