@@ -14,6 +14,8 @@ import time
 # 方案B（默认）：单工人线程 + 优先级队列串行所有键鼠操作。
 # - 优先级越小越紧急（0 = 抢占级，如紧急逃跑或加血）。
 # - 正常打怪逻辑使用默认优先级 100，保持顺序执行。
+# - 通过 input_broker.create_proxy() 获得 my_con_via_broker，直接调用其鼠标/键盘方法即可自动排队。
+#   如需调整行为，可在调用时增加 input_priority/input_name/input_block/input_timeout 关键字参数。
 # 如需添加新的高优先级命令，调用 input_broker.submit(action, priority=0, name="紧急逃跑")。
 # 方案A：在 kmNet类封装.safe_keypress 中提供最小改动的互斥锁版本，必要时可退回。
 #
@@ -26,7 +28,8 @@ import time
 
 my_con = MyController()
 input_broker = InputBroker(my_con)
-游戏坐标方位 = 游戏坐标系统(my_con)
+my_con_via_broker = input_broker.create_proxy()
+游戏坐标方位 = 游戏坐标系统(my_con_via_broker)
 
 
 def 提交输入任务(action, *args, priority: int = 100, name: str = "", block: bool = True, **kwargs):
@@ -163,9 +166,21 @@ class WorkerThread(QThread):
                     print(f"人物:{人物x},{人物y}")
                     目标方位 = 游戏坐标方位.判断方位(物品x, 物品y, 人物x, 人物y)
                     if abs(物品x - 人物x) == 1 or abs(物品y - 人物y) == 1:
-                        游戏坐标方位.左键点击方位_走路(目标方位,100,300)
+                        提交输入任务(
+                            游戏坐标方位.左键点击方位_走路,
+                            目标方位,
+                            100,
+                            300,
+                            name="捡取物品-走路",
+                        )
                     else:
-                        游戏坐标方位.右键点击方位_跑步(目标方位,100,300)
+                        提交输入任务(
+                            游戏坐标方位.右键点击方位_跑步,
+                            目标方位,
+                            100,
+                            300,
+                            name="捡取物品-跑步",
+                        )
 
                     if 物品x == 人物x and 物品y == 人物y:
                         print(f"到达{物品x},{物品y}")
@@ -335,7 +350,11 @@ class WorkerThread(QThread):
                         while abs(人物x - path[i][0]) >= 2 or abs(人物y - path[i][1]) >= 2:
                             print('寻路中')
                             目标方位 = 游戏坐标方位.判断方位(path[i][0],path[i][1],人物x,人物y)
-                            游戏坐标方位.右键点击方位_跑步(目标方位)
+                            提交输入任务(
+                                游戏坐标方位.右键点击方位_跑步,
+                                目标方位,
+                                name="寻路-跑步",
+                            )
                             人物x, 人物y = 识别人物当前坐标()
                     # F3隐身,让怪物不要攻击自己
                     提交输入任务(my_con.键盘点击, 60, name="F3隐身")
@@ -413,9 +432,21 @@ class WorkerThread(QThread):
                         人物y = int(分割结果[1])
                         目标方位 = 游戏坐标方位.判断方位(352, 348, 人物x, 人物y)
                         if abs(352 - 人物x) == 1 or abs(348 - 人物y) == 1:
-                            游戏坐标方位.左键点击方位_走路(目标方位, 100, 300)
+                            提交输入任务(
+                                游戏坐标方位.左键点击方位_走路,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-接镖走路",
+                            )
                         else:
-                            游戏坐标方位.右键点击方位_跑步(目标方位, 100, 300)
+                            提交输入任务(
+                                游戏坐标方位.右键点击方位_跑步,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-接镖跑步",
+                            )
                         if abs(352 - 人物x)<=2 and abs(348 - 人物y)<=2:
                             self.caozuo.emit("到达接镖位置")
                             break
@@ -492,9 +523,21 @@ class WorkerThread(QThread):
                         人物y = int(分割结果[1])
                         目标方位 = 游戏坐标方位.判断方位(382, 341, 人物x, 人物y)
                         if abs(382 - 人物x) == 1 or abs(341 - 人物y) == 1:
-                            游戏坐标方位.左键点击方位_走路(目标方位, 100,300)
+                            提交输入任务(
+                                游戏坐标方位.左键点击方位_走路,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-交镖走路",
+                            )
                         else:
-                            游戏坐标方位.右键点击方位_跑步(目标方位, 100,300)
+                            提交输入任务(
+                                游戏坐标方位.右键点击方位_跑步,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-交镖跑步",
+                            )
                         # 镖车走的慢,要等镖车
                         随机延时(2000, 2500)
                         self.caozuo.emit(f"{人物x},{人物y}")

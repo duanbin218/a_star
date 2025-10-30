@@ -77,6 +77,7 @@ class _InputTask:
     name: str = field(default="", compare=False)
     done: threading.Event = field(default_factory=threading.Event, compare=False)
     error: Optional[BaseException] = field(default=None, compare=False)
+    result: Any = field(default=None, compare=False)
 
 
 class InputBroker:
@@ -98,6 +99,7 @@ class InputBroker:
         self._queue: "queue.PriorityQueue[_InputTask]" = queue.PriorityQueue()
         self._sequence = itertools.count()
         self._stop_event = threading.Event()
+        self._worker_context = threading.local()
         self._worker = threading.Thread(target=self._run, name=name, daemon=True)
         self._worker.start()
 
@@ -116,7 +118,7 @@ class InputBroker:
         block: bool = True,
         timeout: Optional[float] = None,
         **kwargs,
-    ) -> _InputTask:
+    ) -> Any:
         """提交一个键鼠任务。
 
         Args:
@@ -128,7 +130,7 @@ class InputBroker:
             timeout: 等待完成的超时时间（秒）。
 
         Returns:
-            _InputTask: 任务对象，可用于等待或检查错误。
+            Any: block=True 时返回底层函数的执行结果；block=False 时返回 _InputTask。
         """
 
         if self._stop_event.is_set():
@@ -150,6 +152,7 @@ class InputBroker:
                 raise TimeoutError(f"等待任务 {task.name or action.__name__} 超时")
             if task.error:
                 raise task.error
+            return task.result
 
         return task
 
@@ -168,6 +171,11 @@ class InputBroker:
         )
         self._worker.join(timeout=1)
 
+    def is_worker_thread(self) -> bool:
+        """判断当前调用是否位于 Broker 的工人线程中。"""
+
+        return getattr(self._worker_context, "in_worker", False)
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -176,12 +184,20 @@ class InputBroker:
                 continue
 
             try:
-                task.action(*task.args, **task.kwargs)
+                self._worker_context.in_worker = True
+                task.result = task.action(*task.args, **task.kwargs)
             except BaseException as exc:  # noqa: BLE001 - 记录并传播所有异常
                 task.error = exc
                 print(f"[InputBroker] 任务 {task.name or task.action.__name__} 执行失败: {exc}")
             finally:
+                self._worker_context.in_worker = False
                 task.done.set()
+
+
+    def create_proxy(self, default_priority: int = 100) -> "BrokeredController":
+        """创建一个控制器代理，自动通过 Broker 串行化所有方法。"""
+
+        return BrokeredController(self, default_priority=default_priority)
 
 
 # 方案A：最小改动的互斥锁封装，供极端情况下退回旧逻辑
@@ -213,6 +229,44 @@ def safe_keypress(controller: "MyController", hid_value: int, 延时a: int = 70,
             break
         finally:
             my_con_lock.release()
+
+
+class BrokeredController:
+    """InputBroker 的控制器代理，确保所有键鼠方法都经过串行调度。
+
+    使用说明：
+        * 常规调用保持与 :class:`MyController` 相同的签名，返回值一致。
+        * 可额外传入 input_priority/input_name/input_block/input_timeout 关键字
+          参数，以调节排队优先级、任务标识、是否阻塞等待以及等待超时时间。
+    """
+
+    def __init__(self, broker: "InputBroker", default_priority: int = 100):
+        self._broker = broker
+        self._default_priority = default_priority
+
+    def __getattr__(self, item: str):
+        target = getattr(self._broker.controller, item)
+        if not callable(target):
+            return target
+
+        def _call_through_broker(*args, **kwargs):
+            priority = kwargs.pop("input_priority", self._default_priority)
+            name = kwargs.pop("input_name", item)
+            block = kwargs.pop("input_block", True)
+            timeout = kwargs.pop("input_timeout", None)
+            if self._broker.is_worker_thread():
+                return target(*args, **kwargs)
+            return self._broker.submit(
+                target,
+                *args,
+                priority=priority,
+                name=name,
+                block=block,
+                timeout=timeout,
+                **kwargs,
+            )
+
+        return _call_through_broker
 
 class 游戏坐标系统():
     def __init__(self,MouseController=None):
