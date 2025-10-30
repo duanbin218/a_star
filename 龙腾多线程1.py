@@ -2,17 +2,40 @@ import cv2
 from 新大漠插件 import *
 import sys
 from PyQt5 import uic
-from PyQt5.QtWidgets import QApplication, QMainWindow,QPushButton
-from PyQt5.QtCore import QThread, pyqtSignal,Qt, QEvent
-from kmNet类封装 import *
+from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QEvent
+from kmNet类封装 import InputBroker, MyController, 延时, 游戏坐标系统
 
 
 import heapq
 import numpy as np
 import time
 
+# 方案B（默认）：单工人线程 + 优先级队列串行所有键鼠操作。
+# - 优先级越小越紧急（0 = 抢占级，如紧急逃跑或加血）。
+# - 正常打怪逻辑使用默认优先级 100，保持顺序执行。
+# - 通过 input_broker.create_proxy() 获得 my_con_via_broker，直接调用其鼠标/键盘方法即可自动排队。
+#   如需调整行为，可在调用时增加 input_priority/input_name/input_block/input_timeout 关键字参数。
+# 如需添加新的高优先级命令，调用 input_broker.submit(action, priority=0, name="紧急逃跑")。
+# 方案A：在 kmNet类封装.safe_keypress 中提供最小改动的互斥锁版本，必要时可退回。
+#
+# 本地验证（Windows）：
+# 1. 在安装了大漠插件（DM）和 pywin32 的环境运行 GUI，启动“打怪”“血量”线程。
+#    观察日志，低血量时抢占触发，键鼠操作串行无冲突。
+# 2. 若缺少 DM 或 pywin32：
+#    - DM 不存在时，相关 API 会抛异常；InputBroker 仍可单独测试，使用 my_con 模拟。
+#    - 无 pywin32 时，需安装或将 MyController 相关调用替换为 mock；Broker 不依赖额外三方库。
+
 my_con = MyController()
-游戏坐标方位 = 游戏坐标系统(my_con)
+input_broker = InputBroker(my_con)
+my_con_via_broker = input_broker.create_proxy()
+游戏坐标方位 = 游戏坐标系统(my_con_via_broker)
+
+
+def 提交输入任务(action, *args, priority: int = 100, name: str = "", block: bool = True, **kwargs):
+    """封装 Broker 提交，避免每次重复填写参数。"""
+
+    return input_broker.submit(action, *args, priority=priority, name=name, block=block, **kwargs)
 
 def 随机延时(最小延时,最大延时):
     随机时间 = random.randint(最小延时,最大延时)
@@ -96,16 +119,19 @@ class WorkerThread(QThread):
                     当前血量 = int(分割结果[0])
                     最大血量 = int(分割结果[1])
                     self.jiankong.emit(f"当前血量:{当前血量}|最大血量:{最大血量}")
-                    if 0<当前血量/最大血量 < 0.9:
+                    if 0 < 当前血量/最大血量 < 0.9:
                         self.jiankong.emit("要加血了,按F1加血")
-                        preempt_event.set()  # 抢占键鼠
-                        # my_con.键盘点击(58)
-                        随机延时(500,1000)
+                        提交输入任务(
+                            my_con.键盘点击,
+                            58,
+                            priority=0,
+                            name="紧急加血",
+                            block=False,
+                        )
+                        随机延时(500, 1000)
 
                     elif 当前血量 == 0:
                         self.jiankong.emit("人物已死亡,需要重新登录游戏")
-                    if 当前血量 == 最大血量:
-                        preempt_event.clear()  # 释放键鼠
                 time.sleep(1)
         except Exception as e:
             print(e)
@@ -140,9 +166,21 @@ class WorkerThread(QThread):
                     print(f"人物:{人物x},{人物y}")
                     目标方位 = 游戏坐标方位.判断方位(物品x, 物品y, 人物x, 人物y)
                     if abs(物品x - 人物x) == 1 or abs(物品y - 人物y) == 1:
-                        游戏坐标方位.左键点击方位_走路(目标方位,100,300)
+                        提交输入任务(
+                            游戏坐标方位.左键点击方位_走路,
+                            目标方位,
+                            100,
+                            300,
+                            name="捡取物品-走路",
+                        )
                     else:
-                        游戏坐标方位.右键点击方位_跑步(目标方位,100,300)
+                        提交输入任务(
+                            游戏坐标方位.右键点击方位_跑步,
+                            目标方位,
+                            100,
+                            300,
+                            name="捡取物品-跑步",
+                        )
 
                     if 物品x == 人物x and 物品y == 人物y:
                         print(f"到达{物品x},{物品y}")
@@ -312,12 +350,16 @@ class WorkerThread(QThread):
                         while abs(人物x - path[i][0]) >= 2 or abs(人物y - path[i][1]) >= 2:
                             print('寻路中')
                             目标方位 = 游戏坐标方位.判断方位(path[i][0],path[i][1],人物x,人物y)
-                            游戏坐标方位.右键点击方位_跑步(目标方位)
+                            提交输入任务(
+                                游戏坐标方位.右键点击方位_跑步,
+                                目标方位,
+                                name="寻路-跑步",
+                            )
                             人物x, 人物y = 识别人物当前坐标()
                     # F3隐身,让怪物不要攻击自己
-                    my_con.键盘点击(60)
+                    提交输入任务(my_con.键盘点击, 60, name="F3隐身")
                     随机延时(1400, 1600)
-                    my_con.键盘点击(65)
+                    提交输入任务(my_con.键盘点击, 65, name="F8召唤")
                     # F8召唤宝宝技能释放时间大概1200 - 1300
                     self.fighting()
 
@@ -390,9 +432,21 @@ class WorkerThread(QThread):
                         人物y = int(分割结果[1])
                         目标方位 = 游戏坐标方位.判断方位(352, 348, 人物x, 人物y)
                         if abs(352 - 人物x) == 1 or abs(348 - 人物y) == 1:
-                            游戏坐标方位.左键点击方位_走路(目标方位, 100, 300)
+                            提交输入任务(
+                                游戏坐标方位.左键点击方位_走路,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-接镖走路",
+                            )
                         else:
-                            游戏坐标方位.右键点击方位_跑步(目标方位, 100, 300)
+                            提交输入任务(
+                                游戏坐标方位.右键点击方位_跑步,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-接镖跑步",
+                            )
                         if abs(352 - 人物x)<=2 and abs(348 - 人物y)<=2:
                             self.caozuo.emit("到达接镖位置")
                             break
@@ -403,19 +457,55 @@ class WorkerThread(QThread):
                 for i in range(30):
                     z, x, y = self.大漠对象.AiFindPic(5, 28, 1916, 823, r"./pic/镖局.bmp", 0.8, 0)
                     if z != -1:
-                        my_con.move_with_left_click(x + 25, y - 34, -1, 1, 0, 10)
+                        提交输入任务(
+                            my_con.move_with_left_click,
+                            x + 25,
+                            y - 34,
+                            -1,
+                            1,
+                            0,
+                            10,
+                            name="点击镖师",
+                        )
                         随机延时(200, 500)
                     z, x, y = self.大漠对象.AiFindPic(8, 9, 390, 164, r"./pic/开始押镖.bmp", 0.8, 0)
                     if z != -1 :
-                        my_con.move_with_left_click(x, y, 0, 20, 0, 8)
+                        提交输入任务(
+                            my_con.move_with_left_click,
+                            x,
+                            y,
+                            0,
+                            20,
+                            0,
+                            8,
+                            name="开始押镖",
+                        )
                         随机延时(200, 500)
                     z, x, y = self.大漠对象.AiFindPic(8, 9, 390, 164, r"./pic/接受护送.bmp", 0.8, 0)
                     if z != -1 :
-                        my_con.move_with_left_click(x, y,  0, 20, 0, 7)
+                        提交输入任务(
+                            my_con.move_with_left_click,
+                            x,
+                            y,
+                            0,
+                            20,
+                            0,
+                            7,
+                            name="接受护送",
+                        )
                         随机延时(200, 500)
                     z, x, y = self.大漠对象.AiFindPic(700, 428, 1223, 657, r"./pic/镖车确定.bmp", 0.8,0)
                     if z != -1:
-                        my_con.move_with_left_click(x, y, 0, 30, 0, 10)
+                        提交输入任务(
+                            my_con.move_with_left_click,
+                            x,
+                            y,
+                            0,
+                            30,
+                            0,
+                            10,
+                            name="确认镖车",
+                        )
                         随机延时(200, 500)
                         # 有时候找图找的坐标不准确,没有"镖车确定"的图片,就是接到镖车了
                         z, x, y = self.大漠对象.AiFindPic(700, 428, 1223, 657, r"./pic/镖车确定.bmp", 0.8, 0)
@@ -433,9 +523,21 @@ class WorkerThread(QThread):
                         人物y = int(分割结果[1])
                         目标方位 = 游戏坐标方位.判断方位(382, 341, 人物x, 人物y)
                         if abs(382 - 人物x) == 1 or abs(341 - 人物y) == 1:
-                            游戏坐标方位.左键点击方位_走路(目标方位, 100,300)
+                            提交输入任务(
+                                游戏坐标方位.左键点击方位_走路,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-交镖走路",
+                            )
                         else:
-                            游戏坐标方位.右键点击方位_跑步(目标方位, 100,300)
+                            提交输入任务(
+                                游戏坐标方位.右键点击方位_跑步,
+                                目标方位,
+                                100,
+                                300,
+                                name="押镖-交镖跑步",
+                            )
                         # 镖车走的慢,要等镖车
                         随机延时(2000, 2500)
                         self.caozuo.emit(f"{人物x},{人物y}")
@@ -447,18 +549,36 @@ class WorkerThread(QThread):
                 for i in range(30):
                     z, x, y = self.大漠对象.AiFindPic(11, 55, 1915, 718, r"./pic/镖局总管.bmp", 0.8,0)
                     if z != -1:
-                        my_con.move_with_left_click(x, y, 0, 23, 0, 10)
+                        提交输入任务(
+                            my_con.move_with_left_click,
+                            x,
+                            y,
+                            0,
+                            23,
+                            0,
+                            10,
+                            name="交镖-点击总管",
+                        )
                         随机延时(200, 500)
                     z, x, y = self.大漠对象.AiFindPic(11, 20, 389, 161, r"./pic/完成任务.bmp", 0.8, 0)
                     if z != -1:
-                        my_con.move_with_left_click(x, y,  0, 15, 0, 8)
+                        提交输入任务(
+                            my_con.move_with_left_click,
+                            x,
+                            y,
+                            0,
+                            15,
+                            0,
+                            8,
+                            name="交镖-完成任务",
+                        )
                         随机延时(1000, 1500)
                         # 没找到完成任务,就是已经交任务了
                         z, x, y = self.大漠对象.AiFindPic(11, 20, 389, 161, r"./pic/完成任务.bmp", 0.8, 0)
                         if z == -1:
                             self.caozuo.emit("镖车交接完成")
-                            # 按1键回城
-                            # my_con.键盘点击(30,100,300)
+                            # 按1键回城（示例，使用高优先级抢占输入）
+                            # 提交输入任务(my_con.键盘点击, 30, priority=10, name="回城", block=False)
                             break
                         continue
                     随机延时(50, 100)
